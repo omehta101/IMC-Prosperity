@@ -123,24 +123,9 @@ class Trader:
     POSITION_LIMITS = {'AMETHYSTS': 20, 'STARFRUIT': 20, 'CHOCOLATE': 250, 'STRAWBERRIES': 350, 'ROSES': 60, 'GIFT_BASKET': 60} 
     POSITIONS = {'AMETHYSTS': 0, 'STARFRUIT': 0, 'CHOCOLATE': 0, 'STRAWBERRIES': 0, 'ROSES': 0, 'GIFT_BASKET': 0}
     curr_starfruit_price = 0
-    differences_cache = []
 
+    basket_std = 162
 
-    def values_extract(self, order_dict, buy=0):
-        tot_vol = 0
-        best_val = -1
-        mxvol = -1
-
-        for ask, vol in order_dict.items():
-            if(buy==0):
-                vol *= -1
-            tot_vol += vol
-            if tot_vol > mxvol:
-                mxvol = vol
-                best_val = ask
-        
-        return tot_vol, best_val
-    
     def calc_starfruit_price(self):
         if len(self.starfruit_cache) < 4:
             return None
@@ -149,13 +134,13 @@ class Trader:
             next_price += price * self.STARFRUIT_COEF[i]
         return next_price
 
-    def compute_amethysts_orders(self, state):
+    def handle_amethysts_orders(self, state):
         orders = []
         order_depth: OrderDepth = state.order_depths['AMETHYSTS']
         current_position = self.POSITIONS['AMETHYSTS']
         position_limit = self.POSITION_LIMITS['AMETHYSTS']
-        amethysts_lb = 10000
-        amethysts_ub = 10000
+        amethysts_lb = 9999
+        amethysts_ub = 10001
 
         for ask, qty in order_depth.sell_orders.items():
             if ask < amethysts_lb and current_position < position_limit:
@@ -172,7 +157,7 @@ class Trader:
         self.POSITIONS['AMETHYSTS'] = current_position
         return orders
 
-    def compute_starfruit_orders(self, state):
+    def handle_starfruit_orders(self, state):
         orders = []
         order_depth: OrderDepth = state.order_depths['STARFRUIT']
         current_position = self.POSITIONS['STARFRUIT']
@@ -195,16 +180,12 @@ class Trader:
         self.POSITIONS['STARFRUIT'] = current_position
         return orders
     
-
     def compute_orders_basket(self, state):
-
         orders = {'GIFT_BASKET': [], 'STRAWBERRIES': [], 'CHOCOLATE': [], 'ROSES': []}
-        prods = ['ROSES', 'GIFT_BASKET', 'STRAWBERRIES', 'CHOCOLATE']
-
+        prods = ['STRAWBERRIES', 'CHOCOLATE', 'ROSES']
         order_depth = state.order_depths
 
-        osell, obuy, best_sell, best_buy, mid_price, worst_buy, worst_sell = {}, {}, {}, {}, {}, {}, {}
-
+        osell, obuy, best_sell, best_buy, mid_price = {}, {}, {}, {}, {}
         for p in list(orders.keys()):
             osell[p] = collections.OrderedDict(sorted(order_depth[p].sell_orders.items()))
             obuy[p] = collections.OrderedDict(sorted(order_depth[p].buy_orders.items(), reverse=True))
@@ -212,77 +193,104 @@ class Trader:
             best_sell[p] = next(iter(osell[p]))
             best_buy[p] = next(iter(obuy[p]))
 
-            worst_sell[p] = next(reversed(osell[p]))
-            worst_buy[p] = next(reversed(obuy[p]))
-
             mid_price[p] = (best_sell[p] + best_buy[p]) / 2
 
         theoretical_price = mid_price['STRAWBERRIES'] * 6 + mid_price['CHOCOLATE'] * 4 + mid_price['ROSES'] + 370
         actual_price = mid_price['GIFT_BASKET']
         price_difference = actual_price - theoretical_price
 
-        self.differences_cache.append(price_difference)
-        
-        # Computing the rolling mean and standard deviation of the price differences
-        window_size = 200
-        if len(self.differences_cache) > window_size:
-            windowed_data = self.differences_cache[-window_size:]
-            mean_difference = np.mean(windowed_data)
-            std_difference = np.std(windowed_data) # Only consider the last 'window_size' elements
-        else:
-            mean_difference = 9
-            std_difference = 75
+        threshold = 162*0.4  
+        current_position_gb = self.POSITIONS['GIFT_BASKET']
+        position_limit_gb = self.POSITION_LIMITS['GIFT_BASKET']
 
-        threshold_u = mean_difference + std_difference
-        threshold_d = mean_difference - (0.5*std_difference) 
-        
-        if price_difference > threshold_u: 
-            for prod in prods:
-                curr_position = self.POSITIONS[prod]
-                position_limit = self.POSITION_LIMITS[prod]
-                for bid, qty in order_depth[prod].buy_orders.items():
-                    vol = position_limit+curr_position
-                    if vol > 0:
-                        quantity = min(qty, vol)
-                        orders[prod].append(Order(prod, bid, -quantity))
-                        curr_position -= quantity
-                    else: break
-                logger.print(f'SUBMITTED SHORT {prod}')
-                self.POSITIONS[prod] = curr_position
+        # Determine actions based on the price difference
+        if price_difference > threshold:
+            # Actual basket price is higher than theoretical, sell the basket and buy the assets
+            for ask, qty in state.order_depths['GIFT_BASKET'].sell_orders.items():
+                if current_position_gb > -position_limit_gb:
+                    quantity = min(qty, current_position_gb + position_limit_gb)
+                    orders['GIFT_BASKET'].append(Order('GIFT_BASKET', ask, -quantity))
+                    current_position_gb -= quantity
 
-        elif price_difference < threshold_d: 
-            for prod in prods:
-                curr_position = self.POSITIONS[prod]
-                position_limit = self.POSITION_LIMITS[prod]
-                for ask, qty in order_depth[prod].sell_orders.items():
-                    vol = position_limit-curr_position
-                    if vol > 0:
-                        quantity = min(-qty, vol)
-                        orders[prod].append(Order(prod, ask, quantity))
-                        curr_position += quantity
-                    else: break
-                logger.print(f'SUBMITTED LONG {prod}')
-                self.POSITIONS[prod] = curr_position
+            for p in prods:
+                order_depth: OrderDepth = state.order_depths[p]
+                curr_position = self.POSITIONS[p]
+                pos_lim = self.POSITION_LIMITS[p]
+                for bid, qty in order_depth.buy_orders.items():
+                    if pos_lim > curr_position:
+                        quantity = min(qty, pos_lim-curr_position)
+                        orders[p].append(Order(p, bid, quantity))
+                        self.POSITIONS[p] += quantity
+                logger.print(f'SUBMITTING NEW LONG on {p} from QUANTITY {curr_position} TO MAKE POSITION {self.POSITIONS[p]} WHILE SHORTING BASKET')
+
+        elif price_difference < -threshold:
+            # Actual basket price is lower than theoretical, consider buying the basket
+            for bid, qty in state.order_depths['GIFT_BASKET'].buy_orders.items():
+                if position_limit_gb > current_position_gb:
+                    quantity = min(qty, position_limit_gb - current_position_gb)
+                    orders['GIFT_BASKET'].append(Order('GIFT_BASKET', bid, quantity))
+                    current_position_gb += quantity
+            
+            for p in prods:
+                order_depth: OrderDepth = state.order_depths[p]
+                curr_position = self.POSITIONS[p]
+                pos_lim = -self.POSITION_LIMITS[p]
+                for ask, qty in order_depth.sell_orders.items():
+                    if curr_position > -pos_lim:
+                        quantity = min(qty, pos_lim+curr_position)
+                        orders[p].append(Order(p, ask, -quantity))
+                        self.POSITIONS[p] -= quantity   
+                logger.print(f'SUBMITTING NEW SHORT on {p} from QUANTITY {curr_position} TO MAKE POSITION {self.POSITIONS[p]} WHILE LONGING BASKET')
+
+        if 0 < price_difference <= 10 and current_position_gb > 0:
+            logger.print('EXITING LONG BASKET AND SHORT PRODS POSITION')
+            for ask, qty in state.order_depths['GIFT_BASKET'].sell_orders.items():
+                quantity = min(qty, current_position_gb)
+                orders['GIFT_BASKET'].append(Order('GIFT_BASKET', ask, -quantity))
+                current_position_gb -= quantity
+
+            for p in prods:
+                order_depth: OrderDepth = state.order_depths[p]
+                curr_position = self.POSITIONS[p]
+                pos_lim = self.POSITION_LIMITS[p]
+                for bid, qty in order_depth.buy_orders.items():
+                    if curr_position > - pos_lim:
+                        quantity = min(qty, -curr_position)
+                        orders[p].append(Order(p, bid, quantity))
+                        self.POSITIONS[p] += quantity
+                    logger.print(f'COVERING SHORTS ON {p} from QUANTITY {curr_position} to {self.POSITIONS[p]} AFTER CLOSING LONG BASKET')
+
+
+        elif -30 <= price_difference < 0 and current_position_gb < 0:
+            logger.print('EXITING SHORT BASKET AND LONG PRODS POSITION')
+            for bid, qty in state.order_depths['GIFT_BASKET'].buy_orders.items():
+                quantity = min(qty, -current_position_gb)
+                orders['GIFT_BASKET'].append(Order('GIFT_BASKET', bid, quantity))
+                current_position_gb += quantity
+
+            for p in prods:
+                order_depth: OrderDepth = state.order_depths[p]
+                curr_position = self.POSITIONS[p]
+                pos_lim = self.POSITION_LIMITS[p]
+                for ask, qty in order_depth.sell_orders.items():
+                    if 0 < curr_position <= pos_lim:
+                        quantity = min(qty, -curr_position)
+                        orders[p].append(Order(p, ask, -quantity))
+                        self.POSITIONS[p] -= quantity
+                        logger.print(f'SELLING LONG {p} from QUANTITY {curr_position} to {self.POSITIONS[p]} AFTER COVERING SHORT BASKET')
         
-        logger.print(f'SUBMITTING THE FOLLOWING ORDERS: {orders}')
+        self.POSITIONS['GIFT_BASKET'] = current_position_gb
         return orders
-
 
     
     def run(self, state: TradingState) -> tuple[dict[Symbol, list[Order]], int, str]:
         result = {}
-
-        for key, val in state.position.items():
-            self.POSITIONS[key] = val
-
         if 'AMETHYSTS' in state.order_depths:
-            result['AMETHYSTS'] = self.compute_amethysts_orders(state)
+            result['AMETHYSTS'] = self.handle_amethysts_orders(state)
         if 'STARFRUIT' in state.order_depths:
-            result['STARFRUIT'] = self.compute_starfruit_orders(state)
-        
-        orders = self.compute_orders_basket(state)
+            result['STARFRUIT'] = self.handle_starfruit_orders(state)
         for prod in ['GIFT_BASKET', 'STRAWBERRIES', 'CHOCOLATE', 'ROSES']:
-            result[prod] = orders[prod]
+            result[prod] = self.compute_orders_basket(state)[prod]
 
         
         if 'STARFRUIT' in state.order_depths:
